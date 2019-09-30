@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -57,7 +58,7 @@ var (
 	runtimes      int
 	tls           bool
 
-	nodeID string
+	envoyNodeIDs string
 )
 
 const grpcMaxConcurrentStreams = 1000000
@@ -66,6 +67,8 @@ func init() {
 	flag.BoolVar(&debug, "debug", true, "Use debug logging")
 	flag.UintVar(&port, "port", 18000, "Management server port")
 	flag.UintVar(&gatewayPort, "gateway", 18001, "Management server port for HTTP gateway")
+	flag.StringVar(&envoyNodeIDs, "nodeIDs", "envoy_1,envoy_2", "comma-separated list of envoy node ids")
+
 	// flag.UintVar(&upstreamPort, "upstream", 18080, "Upstream HTTP/1.1 port")
 	// flag.UintVar(&basePort, "base", 9000, "Listener port")
 	// flag.UintVar(&alsPort, "als", 18090, "Accesslog server port")
@@ -77,7 +80,6 @@ func init() {
 	// flag.IntVar(&httpListeners, "http", 2, "Number of HTTP listeners (and RDS configs)")
 	// flag.IntVar(&tcpListeners, "tcp", 2, "Number of TCP pass-through listeners")
 	// flag.IntVar(&runtimes, "runtimes", 1, "Number of RTDS layers")
-	// flag.StringVar(&nodeID, "nodeID", "test-id", "Node ID")
 	// flag.BoolVar(&tls, "tls", false, "Enable TLS on all listeners and use SDS for secret delivery")
 }
 
@@ -121,6 +123,8 @@ func runManagementServer(ctx context.Context, server xds.Server, port uint) {
 // main returns code 1 if any of the batches failed to pass all requests
 func main() {
 	flag.Parse()
+
+	nodeIDs := strings.Split(envoyNodeIDs, ",")
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// start upstream
@@ -145,10 +149,16 @@ func main() {
 		log.Printf("snapshot inconsistency: %+v\n", snapshot)
 	}
 
-	err := config.SetSnapshot(nodeID, snapshot)
-	if err != nil {
-		log.Printf("snapshot error %q for %+v\n", err, snapshot)
-		os.Exit(1)
+	// populate the config for the envoy-node-ids
+	for _, n := range nodeIDs {
+		id := strings.TrimSpace(n)
+		log.Printf("setting snapshot for node %s", id)
+		err := config.SetSnapshot(id, snapshot)
+		if err != nil {
+			log.Printf("snapshot error %q for %+v\n", err, snapshot)
+			cancel()
+			os.Exit(1)
+		}
 	}
 
 	osSignals := make(chan os.Signal, 1)
