@@ -33,7 +33,6 @@ import (
 	"github.com/envoyproxy/go-control-plane/pkg/cache"
 	"github.com/envoyproxy/go-control-plane/pkg/server"
 	xds "github.com/envoyproxy/go-control-plane/pkg/server"
-	"github.com/envoyproxy/go-control-plane/pkg/test/resource"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
@@ -63,7 +62,8 @@ func main() {
 	cb := &callbacks{signal: sigs}
 
 	// config holds all the latest discovery information
-	config := cache.NewSnapshotCache(mode == resource.Ads, cache.IDHash{}, logger{})
+	isAds := false
+	config := cache.NewSnapshotCache(isAds, cache.IDHash{}, logger{})
 
 	// srv links the config and callbacks
 	srv := server.NewServer(config, cb)
