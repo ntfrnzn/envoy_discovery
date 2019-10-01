@@ -39,25 +39,8 @@ import (
 )
 
 var (
-	debug bool
-
+	debug        bool
 	port         uint
-	gatewayPort  uint
-	upstreamPort uint
-	basePort     uint
-	alsPort      uint
-
-	delay    time.Duration
-	requests int
-	updates  int
-
-	mode          string
-	clusters      int
-	httpListeners int
-	tcpListeners  int
-	runtimes      int
-	tls           bool
-
 	envoyNodeIDs string
 )
 
@@ -66,21 +49,70 @@ const grpcMaxConcurrentStreams = 1000000
 func init() {
 	flag.BoolVar(&debug, "debug", true, "Use debug logging")
 	flag.UintVar(&port, "port", 18000, "Management server port")
-	flag.UintVar(&gatewayPort, "gateway", 18001, "Management server port for HTTP gateway")
 	flag.StringVar(&envoyNodeIDs, "nodeIDs", "envoy_1,envoy_2", "comma-separated list of envoy node ids")
+}
 
-	// flag.UintVar(&upstreamPort, "upstream", 18080, "Upstream HTTP/1.1 port")
-	// flag.UintVar(&basePort, "base", 9000, "Listener port")
-	// flag.UintVar(&alsPort, "als", 18090, "Accesslog server port")
-	// flag.DurationVar(&delay, "delay", 500*time.Millisecond, "Interval between request batch retries")
-	// flag.IntVar(&requests, "r", 5, "Number of requests between snapshot updates")
-	// flag.IntVar(&updates, "u", 3, "Number of snapshot updates")
-	// flag.StringVar(&mode, "xds", resource.Ads, "Management server type (ads, xds, rest)")
-	// flag.IntVar(&clusters, "clusters", 4, "Number of clusters")
-	// flag.IntVar(&httpListeners, "http", 2, "Number of HTTP listeners (and RDS configs)")
-	// flag.IntVar(&tcpListeners, "tcp", 2, "Number of TCP pass-through listeners")
-	// flag.IntVar(&runtimes, "runtimes", 1, "Number of RTDS layers")
-	// flag.BoolVar(&tls, "tls", false, "Enable TLS on all listeners and use SDS for secret delivery")
+// main returns code 1 if any of the batches failed to pass all requests
+func main() {
+	flag.Parse()
+
+	nodeIDs := strings.Split(envoyNodeIDs, ",")
+
+	// create a cache
+	sigs := make(chan struct{})
+	cb := &callbacks{signal: sigs}
+
+	// config holds all the latest discovery information
+	config := cache.NewSnapshotCache(mode == resource.Ads, cache.IDHash{}, logger{})
+
+	// srv links the config and callbacks
+	srv := server.NewServer(config, cb)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go runManagementServer(ctx, srv, port)
+
+	// do discovery every 15 seconds
+	// changes (if any) in the hashed resources will prompt an update
+	ticker := time.NewTicker(15 * time.Second)
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				snapshot := Discover()
+				log.Printf("validating snapshot %+v\n", snapshot)
+				if err := snapshot.Consistent(); err != nil {
+					log.Printf("snapshot inconsistency: %+v\n", snapshot)
+				}
+				// populate the config for each envoy-node-id
+				for _, n := range nodeIDs {
+					id := strings.TrimSpace(n)
+					log.Printf("setting snapshot for node %s", id)
+					err := config.SetSnapshot(id, snapshot)
+					if err != nil {
+						log.Printf("snapshot error %q for %+v\n", err, snapshot)
+					}
+				}
+			}
+		}
+	}()
+
+	// wait for signal to exit
+	osSignals := make(chan os.Signal, 1)
+	signal.Notify(osSignals, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-osSignals
+		ticker.Stop()
+		done <- true
+		cancel()
+	}()
+	select {
+	case <-ctx.Done():
+		log.Printf("exiting after cancellation")
+		os.Exit(0)
+	}
 }
 
 // runManagementServer starts an xDS server at the given port.
@@ -118,62 +150,6 @@ func runManagementServer(ctx context.Context, server xds.Server, port uint) {
 	<-ctx.Done()
 
 	grpcServer.GracefulStop()
-}
-
-// main returns code 1 if any of the batches failed to pass all requests
-func main() {
-	flag.Parse()
-
-	nodeIDs := strings.Split(envoyNodeIDs, ",")
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// start upstream
-	// go test.RunHTTP(ctx, upstreamPort)
-
-	// create a cache
-	sigs := make(chan struct{})
-
-	cb := &callbacks{signal: sigs}
-
-	// config holds all the latest discovery information
-	config := cache.NewSnapshotCache(mode == resource.Ads, cache.IDHash{}, logger{})
-
-	// srv links the config and callbacks
-	srv := server.NewServer(config, cb)
-
-	go runManagementServer(ctx, srv, port)
-
-	snapshot := Discover()
-	log.Printf("validating snapshot %+v\n", snapshot)
-	if err := snapshot.Consistent(); err != nil {
-		log.Printf("snapshot inconsistency: %+v\n", snapshot)
-	}
-
-	// populate the config for the envoy-node-ids
-	for _, n := range nodeIDs {
-		id := strings.TrimSpace(n)
-		log.Printf("setting snapshot for node %s", id)
-		err := config.SetSnapshot(id, snapshot)
-		if err != nil {
-			log.Printf("snapshot error %q for %+v\n", err, snapshot)
-			cancel()
-			os.Exit(1)
-		}
-	}
-
-	osSignals := make(chan os.Signal, 1)
-	signal.Notify(osSignals, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-osSignals
-		cancel()
-	}()
-
-	select {
-	case <-ctx.Done():
-		log.Printf("exiting after cancellation")
-		os.Exit(0)
-	}
 }
 
 type logger struct{}
